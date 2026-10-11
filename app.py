@@ -4,18 +4,25 @@ import time
 import socket
 import platform
 import subprocess
+import json
+import urllib.request
+import urllib.error
+import re
 import psutil
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPainter, QColor, QPen, QFont
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
+from PySide6.QtGui import QPainter, QColor, QPen, QFont, QDesktopServices
+from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QProgressBar,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QLineEdit, QAbstractItemView, QScrollArea
+    QLineEdit, QAbstractItemView, QScrollArea, QMessageBox
 )
 
 APP = "SystemInformation"
+APP_VERSION = "0.1.0"
+GITHUB_REPO = "porialinux/systemmanitor"
 
 STYLE = """
 QWidget {
@@ -212,6 +219,58 @@ class Sparkline(QWidget):
             p.drawLine(a[0], a[1], b[0], b[1])
         p.end()
 
+
+
+class UpdateChecker(QThread):
+    result = Signal(object)
+
+    def run(self):
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        request = urllib.request.Request(
+            api_url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": APP,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                release = json.loads(response.read().decode("utf-8"))
+
+            tag = str(release.get("tag_name", "")).strip()
+            url = str(release.get("html_url", "")).strip()
+            if not tag or not url.startswith("https://github.com/"):
+                raise ValueError("GitHub release response was invalid")
+
+            def version_tuple(value):
+                numbers = re.findall(r"\d+", value)
+                if not numbers:
+                    raise ValueError("Release tag has no version number")
+                return tuple(int(n) for n in numbers)
+
+            current = version_tuple(APP_VERSION)
+            latest = version_tuple(tag)
+            self.result.emit({
+                "ok": True,
+                "current": APP_VERSION,
+                "latest": tag,
+                "url": url,
+                "update": latest > current,
+            })
+        except urllib.error.HTTPError as exc:
+            message = (
+                "No published GitHub Release was found yet."
+                if exc.code == 404
+                else f"GitHub returned HTTP {exc.code}."
+            )
+            self.result.emit({"ok": False, "error": message})
+        except Exception as exc:
+            self.result.emit({
+                "ok": False,
+                "error": f"Could not check for updates: {exc}",
+            })
+
+
 class SystemInformation(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -238,6 +297,9 @@ class SystemInformation(QMainWindow):
         refresh = QPushButton("↻  Refresh")
         refresh.clicked.connect(self.update_all)
         header.addWidget(refresh)
+        self.update_button = QPushButton('Check for Updates')
+        self.update_button.clicked.connect(self.check_for_updates)
+        header.addWidget(self.update_button)
         outer.addLayout(header)
 
         self.tabs = QTabWidget()
@@ -258,6 +320,59 @@ class SystemInformation(QMainWindow):
         self.timer.timeout.connect(self.update_all)
         self.timer.start(2000)
         self.update_all()
+
+
+    def check_for_updates(self):
+        if getattr(self, "_update_thread", None) is not None:
+            if self._update_thread.isRunning():
+                return
+
+        self.update_button.setEnabled(False)
+        self.update_button.setText("Checking...")
+        self._update_thread = UpdateChecker(self)
+        self._update_thread.result.connect(self.on_update_result)
+        self._update_thread.finished.connect(self.on_update_check_finished)
+        self._update_thread.start()
+
+    def on_update_check_finished(self):
+        self.update_button.setEnabled(True)
+        self.update_button.setText("Check for Updates")
+
+    def on_update_result(self, result):
+        if not result.get("ok"):
+            QMessageBox.information(
+                self,
+                "Update Check",
+                result.get("error", "Update check failed.")
+                + "\n\nYour system monitor will continue working normally.",
+            )
+            return
+
+        latest = result["latest"]
+        if result["update"]:
+            message = (
+                f"A new version is available!\n\n"
+                f"Installed version: {result['current']}\n"
+                f"Latest version: {latest}\n\n"
+                "Open the GitHub Release page to view available downloads?"
+            )
+            answer = QMessageBox.question(
+                self,
+                "Update Available",
+                message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                QDesktopServices.openUrl(QUrl(result["url"]))
+        else:
+            QMessageBox.information(
+                self,
+                "You're up to date",
+                f"Installed version: {result['current']}\n"
+                f"Latest GitHub release: {latest}\n\n"
+                "You're using the latest version.",
+            )
 
     def page(self, title, subtitle):
         page = QWidget()
